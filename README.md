@@ -10,7 +10,9 @@
 | `method1_asap_peak.py` | 方法一：ASAP（论文版），Stage 1 方位谱粗到细，Stage 2 俯仰一维细化取峰值；另含全网格 SRP 参考 |
 | `method2_srp_mmse.py` | 方法二：ASAP Stage 1 + SRP 后验均值（MMSE），含 β 校准函数 |
 | `method3_tdoa_bayes.py` | 方法三：GCC-PHAT 时延 + 加权最小二乘求水平分量 q，再做高斯后验（ML / MAP / MMSE） |
+| `baseline_cfrc.py` | 对比基线：CFRC（粗到细区域收缩） |
 | `run_compare.py` | 对比实验：SNR 扫描、时延实现消融、混响房间；输出 CSV、汇总表和图 |
+| `pareto.py` | 精度–计算量曲线：ASAP 和 CFRC 各扫 8 组参数 |
 
 每个 `method*.py` 都可以单独运行，会打印几个随机方向上的小演示。
 
@@ -21,6 +23,7 @@ pip install numpy pandas matplotlib tabulate pyroomacoustics
 python method1_asap_peak.py        # 单独试方法一
 python run_compare.py --quick      # 快速试跑（约 40 秒）
 python run_compare.py              # 完整实验（几分钟）
+python pareto.py                   # Pareto 曲线（约 1 分钟）
 ```
 
 结果在 `results/`：`all_trials.csv`（逐次结果）、`summary.csv` / `summary.md`（汇总表）、`fig1~3*.png`。
@@ -46,3 +49,15 @@ python run_compare.py              # 完整实验（几分钟）
 - β（方法二的温度参数）在**单独的校准数据**上选，不能用测试数据选。
 - 方法三的后验依赖"时延误差近似高斯"的假设；GCC 挑错峰时这个假设不成立。
 - 后验均值保证的是在先验分布下的**平均**误差最小，不保证每个真实角度都更准，应按俯仰角分段报告误差。
+
+## v3 更新（第二轮修改）
+
+1. **ASAP 方位离群点**（`method1_asap_peak.py` 的 `stage1_azimuth`）
+   - 粗俯仰角集合加上 85°（原来只到 75°，声源接近头顶时容易选错方位）；
+   - 新参数 `n_cand`（默认 2）：保留方位谱上前 2 个峰，各自细化后选得分最高的。`n_cand=1` 即旧做法。
+   - 代价：打分次数从约 194 次增加到约 245 次。
+2. **球面夹角误差**（`common.angular_error`）：估计方向与真实方向的夹角。汇总表新增 `ang_rmse`、`ang_median`、`ang_outlier_rate`。
+3. **β 自适应**（`method2_srp_mmse.BetaByPeak`、`calibrate_beta_by_peak`）：按这次观测的 SRP 峰值高度分 3 档，各用一个 β。
+   校准数据覆盖 −10 到 20 dB 多个 SNR，运行时不需要知道真实 SNR。
+4. **CFRC 基线**（`baseline_cfrc.py`）：默认参数约 240 次打分，是试跑中精度较好的一组，避免对比基线太弱。
+5. **Pareto 曲线**（`pareto.py`）：论文里证明"同样计算量下 ASAP 更准"的关键图。

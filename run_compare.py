@@ -36,10 +36,11 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
-from common import (SRPFeatures, az_error, crb_std_deg, make_source, make_uca, noise_std_from_snr,
+from common import (SRPFeatures, angular_error, az_error, crb_std_deg, make_source, make_uca, noise_std_from_snr,
                     sample_directions, simulate_freefield, simulate_room, snr_from_noise_std, summarize)
 from method1_asap_peak import asap_peak, full_grid
-from method2_srp_mmse import calibrate_beta, srp_mmse
+from method2_srp_mmse import calibrate_beta_by_peak, srp_mmse
+from baseline_cfrc import cfrc
 from method3_tdoa_bayes import tdoa_bayes
 
 plt.rcParams["font.sans-serif"] = ["Noto Sans CJK SC", "DejaVu Sans"]
@@ -59,6 +60,7 @@ def run_methods(feat: SRPFeatures, beta: float) -> Dict[str, Dict]:
                      "time_ms": 1e3 * (time.perf_counter() - t0)}
 
     timed("full_grid", lambda: full_grid(feat))
+    timed("cfrc", lambda: cfrc(feat))
     timed("asap_dense", lambda: asap_peak(feat, dense=True))
     timed("asap_c2f", lambda: asap_peak(feat))
     timed("srp_mmse_flat", lambda: srp_mmse(feat, beta, prior="flat"))
@@ -72,8 +74,8 @@ def run_methods(feat: SRPFeatures, beta: float) -> Dict[str, Dict]:
     return out
 
 
-METHODS = ["full_grid", "asap_dense", "asap_c2f", "srp_mmse_flat", "srp_mmse_sph", "tdoa_ml", "tdoa_mmse"]
-LABELS = {"full_grid": "全网格 SRP", "asap_dense": "ASAP-dense", "asap_c2f": "ASAP-c2f（取峰）",
+METHODS = ["full_grid", "cfrc", "asap_dense", "asap_c2f", "srp_mmse_flat", "srp_mmse_sph", "tdoa_ml", "tdoa_mmse"]
+LABELS = {"full_grid": "全网格 SRP", "cfrc": "CFRC", "asap_dense": "ASAP-dense", "asap_c2f": "ASAP-c2f（取峰）",
           "srp_mmse_flat": "SRP 后验均值（均匀先验）", "srp_mmse_sph": "SRP 后验均值（球面先验）",
           "tdoa_ml": "TDOA-ML", "tdoa_mmse": "TDOA 后验均值"}
 
@@ -84,7 +86,8 @@ def records_for_trial(scenario: str, snr_db: float, az: float, el: float, res: D
     for m, r in res.items():
         rows.append({"scenario": scenario, "snr_db": snr_db, "true_az": az, "true_el": el, "method": m,
                      "est_az": r["az"], "est_el": r["el"], "az_err": float(az_error(r["az"], az)),
-                     "el_err": abs(r["el"] - el), "n_eval": r["n_eval"], "time_ms": r["time_ms"],
+                     "el_err": abs(r["el"] - el),
+                     "ang_err": float(angular_error(r["az"], r["el"], az, el)), "n_eval": r["n_eval"], "time_ms": r["time_ms"],
                      "feat_ms": feat_ms, "crb_az": crb[0], "crb_el": crb[1], **extra})
     return rows
 
@@ -109,15 +112,18 @@ def main():
     base_snr = snr_from_noise_std(ref_src, BASE_NOISE_STD)
     print(f"原代码的噪声设置对应单通道 SNR ≈ {base_snr:.2f} dB")
 
-    # ---------------- β 校准（只在基准 SNR 下做一次，用单独的数据）----------------
+    # ---------------- β 校准（单独的数据，覆盖多个 SNR；按 SRP 峰值高度自适应）----------------
     cal_feats, cal_el = [], []
-    for az, el in sample_directions(args.n_cal, rng_cal):
+    cal_snrs = [-10.0, -5.0, 0.0, 5.0, 10.0, 20.0]
+    for az, el in sample_directions(args.n_cal * len(cal_snrs) // 2, rng_cal):
         s = make_source(rng=rng_cal)
-        x = simulate_freefield(az, el, mics, s, noise_std=BASE_NOISE_STD, rng=rng_cal)
+        ns = noise_std_from_snr(s, float(rng_cal.choice(cal_snrs)))
+        x = simulate_freefield(az, el, mics, s, noise_std=ns, rng=rng_cal)
         cal_feats.append(SRPFeatures.from_signals(x, mics))
         cal_el.append(el)
-    beta, beta_table = calibrate_beta(cal_feats, cal_el)
-    print(f"β 校准结果：{ {k: round(v, 3) for k, v in beta_table.items()} } → β = {beta}")
+    beta, beta_info = calibrate_beta_by_peak(cal_feats, cal_el, n_bins=3)
+    beta_table = {"edges": beta_info["edges"], "betas": beta.betas}
+    print(f"β 校准结果：{beta}")
 
     rows: List[Dict] = []
 
@@ -142,7 +148,7 @@ def main():
             s = make_source(rng=rng)
             x = simulate_freefield(az, el, mics, s, noise_std=BASE_NOISE_STD, delay_mode=mode, rng=rng)
             feat = SRPFeatures.from_signals(x, mics)
-            res = {k: v for k, v in run_methods(feat, beta).items() if k in ("full_grid", "asap_c2f")}
+            res = {k: v for k, v in run_methods(feat, beta).items() if k in ("full_grid", "cfrc", "asap_c2f")}
             rows += records_for_trial(f"delay_{mode}", base_snr, az, el, res,
                                       crb_std_deg(az, el, mics, s, BASE_NOISE_STD), 0.0)
     print("[B] 时延消融完成")
@@ -170,22 +176,22 @@ def main():
     # ---------------- 汇总表 ----------------
     summ = []
     for (sc, snr, m), g in df.groupby(["scenario", "snr_db", "method"], dropna=False, sort=False):
-        s = summarize(g.az_err.values, g.el_err.values, g.true_el.values)
+        s = summarize(g.az_err.values, g.el_err.values, g.true_el.values, ang_err=g.ang_err.values)
         s.update({"scenario": sc, "snr_db": snr, "method": m, "n_eval_mean": g.n_eval.mean(),
                   "time_ms_mean": g.time_ms.mean(),
-                  "crb_el_rms": float(np.sqrt(np.nanmean(g.crb_el ** 2))) if g.crb_el.notna().any() else np.nan,
-                  "crb_az_rms": float(np.sqrt(np.nanmean(g.crb_az[g.true_el < 85] ** 2)))
+                  "crb_el_median": float(np.nanmedian(g.crb_el)) if g.crb_el.notna().any() else np.nan,
+                  "crb_az_median": float(np.nanmedian(g.crb_az[g.true_el < 85]))
                   if g.crb_az.notna().any() else np.nan})
         summ.append(s)
     S = pd.DataFrame(summ)
-    cols = ["scenario", "snr_db", "method", "az_rmse", "az_median", "az_outlier_rate", "el_rmse",
-            "el_median", "el_outlier_rate", "crb_az_rms", "crb_el_rms", "n_eval_mean", "time_ms_mean", "n"]
+    cols = ["scenario", "snr_db", "method", "ang_rmse", "ang_median", "ang_outlier_rate", "az_rmse", "az_median", "az_outlier_rate", "el_rmse",
+            "el_median", "el_outlier_rate", "crb_az_median", "crb_el_median", "n_eval_mean", "time_ms_mean", "n"]
     S = S[cols]
     S.to_csv(os.path.join(args.out, "summary.csv"), index=False)
     with open(os.path.join(args.out, "summary.md"), "w", encoding="utf-8") as f:
         f.write(S.round(3).to_markdown(index=False))
     with open(os.path.join(args.out, "meta.json"), "w", encoding="utf-8") as f:
-        json.dump({"beta": beta, "beta_table": beta_table, "base_snr_db": base_snr,
+        json.dump({"beta": repr(beta), "beta_table": beta_table, "base_snr_db": base_snr,
                    "feat_ms_mean": float(df.loc[df.feat_ms > 0, "feat_ms"].mean())}, f, ensure_ascii=False, indent=2)
 
     make_figures(df, base_snr, args.out)
@@ -193,7 +199,7 @@ def main():
 
 
 def make_figures(df: pd.DataFrame, base_snr: float, out: str):
-    styles = {"full_grid": ("k", "-", "o"), "asap_dense": ("tab:gray", "--", "s"),
+    styles = {"full_grid": ("k", "-", "o"), "cfrc": ("tab:orange", "-", "x"), "asap_dense": ("tab:gray", "--", "s"),
               "asap_c2f": ("tab:blue", "-", "s"), "srp_mmse_flat": ("tab:green", "-", "^"),
               "srp_mmse_sph": ("tab:olive", "--", "^"), "tdoa_ml": ("tab:red", "-", "v"),
               "tdoa_mmse": ("tab:purple", "-", "D")}
@@ -214,8 +220,8 @@ def make_figures(df: pd.DataFrame, base_snr: float, out: str):
         g = d[d.method == "full_grid"]
         if err == "az_err":
             g = g[g.true_el < 85]
-        yc = [np.sqrt(np.mean(g[(g.true_el >= a) & (g.true_el < b)][crb] ** 2)) for a, b in zip(bins[:-1], bins[1:])]
-        ax.plot(centers, yc, color="k", ls=":", lw=2, label="CRB")
+        yc = [np.median(g[(g.true_el >= a) & (g.true_el < b)][crb]) for a, b in zip(bins[:-1], bins[1:])]
+        ax.plot(centers, yc, color="k", ls=":", lw=2, label="CRB（区间中位数）")
         ax.set_yscale("log")
         ax.set_xlabel("真实俯仰角（°）")
         ax.set_ylabel("RMSE（°，对数坐标）")
@@ -241,8 +247,9 @@ def make_figures(df: pd.DataFrame, base_snr: float, out: str):
         g = d[d.method == "full_grid"]
         if err == "az_err":
             g = g[g.true_el < 85]
-        ax.plot(snrs, [np.sqrt(np.mean(g[np.isclose(g.snr_db, s)][crb] ** 2)) for s in snrs],
-                color="k", ls=":", lw=2, label="CRB")
+        # θ→0° 时俯仰 CRB 趋于无穷，用中位数比 RMS 稳定
+        ax.plot(snrs, [np.median(g[np.isclose(g.snr_db, s)][crb]) for s in snrs],
+                color="k", ls=":", lw=2, label="CRB（中位数）")
         ax.set_yscale("log")
         ax.set_xlabel("单通道 SNR（dB）")
         ax.set_ylabel("RMSE（°，对数坐标）")

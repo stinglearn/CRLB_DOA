@@ -25,11 +25,25 @@ from common import SRPFeatures, parabolic_vertex, wrap180
 # ----------------------------------------------------------------------
 # Stage 1：方位谱上的粗到细搜索（方法一、方法二共用）
 # ----------------------------------------------------------------------
+def _circular_peaks(S: np.ndarray, n: int) -> np.ndarray:
+    """在一圈（首尾相接）的方位谱上找局部极大值，按高度从大到小返回前 n 个的下标。"""
+    left, right = np.roll(S, 1), np.roll(S, -1)
+    idx = np.flatnonzero((S >= left) & (S >= right))
+    if len(idx) == 0:
+        idx = np.array([int(np.argmax(S))])
+    return idx[np.argsort(S[idx])[::-1][:n]]
+
+
 def stage1_azimuth(feat: SRPFeatures,
-                   coarse_el: Sequence[float] = (0, 15, 30, 45, 60, 75),
+                   coarse_el: Sequence[float] = (0, 15, 30, 45, 60, 75, 85),
                    az_coarse: float = 15.0, az_win: float = 15.0, az_fine: float = 1.0,
-                   dense: bool = False) -> Tuple[float, float, Dict]:
-    """返回 (φ̂, 粗俯仰 θ̂, 诊断信息)。"""
+                   n_cand: int = 2, dense: bool = False) -> Tuple[float, float, Dict]:
+    """返回 (φ̂, 粗俯仰 θ̂, 诊断信息)。
+
+    【修改 1】coarse_el 加上 85°：原来只到 75°，声源接近头顶时方位谱很平，容易选错峰。
+    【修改 2】n_cand：保留方位谱上前 n_cand 个局部峰，各自细化后选得分最高的，
+              避免第一步在粗网格上选错峰就无法挽回。n_cand=1 即原来的做法。
+    """
     coarse_el = np.asarray(coarse_el, dtype=float)
     step = az_fine if dense else az_coarse
     az_grid = np.arange(-180.0, 180.0, step)
@@ -37,21 +51,25 @@ def stage1_azimuth(feat: SRPFeatures,
     P = feat.score_azel(A, E)
     S = P.max(axis=0)                                       # 方位谱
     k_best = P.argmax(axis=0)
-    j = int(np.argmax(S))
-    th_hat = float(coarse_el[k_best[j]])
 
     if dense:
+        j = int(np.argmax(S))
         # 方位谱是一圈，取相邻点时要绕回
         off = parabolic_vertex(S[j - 1], S[j], S[(j + 1) % len(S)])
         phi_hat = float(wrap180(az_grid[j] + off * step))
-    else:
-        phi0 = az_grid[j]
-        az_f = phi0 + np.arange(-az_win, az_win + 1e-9, az_fine)
-        Pf = feat.score_azel(az_f, th_hat)
+        th_hat = float(coarse_el[k_best[j]])
+        return phi_hat, th_hat, {"azimuth_spectrum": S, "az_grid": az_grid}
+
+    best = (-np.inf, 0.0, 0.0)  # (得分, φ, θ)
+    for j in _circular_peaks(S, n_cand):
+        th_j = float(coarse_el[k_best[j]])
+        az_f = az_grid[j] + np.arange(-az_win, az_win + 1e-9, az_fine)
+        Pf = feat.score_azel(az_f, th_j)
         i = int(np.argmax(Pf))
         off = parabolic_vertex(Pf[i - 1], Pf[i], Pf[i + 1]) if 0 < i < len(Pf) - 1 else 0.0
-        phi_hat = float(wrap180(az_f[i] + off * az_fine))
-    return phi_hat, th_hat, {"azimuth_spectrum": S, "az_grid": az_grid}
+        if Pf[i] > best[0]:
+            best = (float(Pf[i]), float(wrap180(az_f[i] + off * az_fine)), th_j)
+    return best[1], best[2], {"azimuth_spectrum": S, "az_grid": az_grid}
 
 
 # ----------------------------------------------------------------------
@@ -87,7 +105,7 @@ def stage2_elevation_peak(feat: SRPFeatures, phi_hat: float, th_hat: float,
 def asap_peak(feat: SRPFeatures, dense: bool = False, **kw) -> Tuple[float, float, Dict]:
     """ASAP：返回 (方位角, 俯仰角, 诊断信息)。"""
     feat.n_eval = 0
-    s1 = {k: kw[k] for k in ("coarse_el", "az_coarse", "az_win", "az_fine") if k in kw}
+    s1 = {k: kw[k] for k in ("coarse_el", "az_coarse", "az_win", "az_fine", "n_cand") if k in kw}
     s2 = {k: kw[k] for k in ("el_win", "el_coarse", "el_fine", "ls_half") if k in kw}
     phi_hat, th_hat, _ = stage1_azimuth(feat, dense=dense, **s1)
     n1 = feat.n_eval

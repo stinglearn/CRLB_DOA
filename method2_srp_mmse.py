@@ -34,7 +34,13 @@ def log_prior(theta_deg: np.ndarray, prior: str) -> np.ndarray:
 
 
 def posterior_from_scores(theta: np.ndarray, P: np.ndarray, beta: float,
-                          prior: str = "flat") -> Dict[str, float]:
+                          prior: str = "flat", fine_step: float = 0.05) -> Dict[str, float]:
+    # 把 1° 间隔的得分线性插值到细网格上再算后验（不增加打分次数）。
+    # 否则 β 较大时后验集中在一两个网格点上，后验均值会被网格"量化"。
+    if fine_step and len(theta) > 1:
+        tf = np.arange(theta[0], theta[-1] + 1e-9, fine_step)
+        P = np.interp(tf, theta, P)
+        theta = tf
     logw = beta * (P - P.max()) + log_prior(theta, prior)
     w = np.exp(logw - logw.max())
     w /= w.sum()
@@ -47,10 +53,31 @@ def posterior_from_scores(theta: np.ndarray, P: np.ndarray, beta: float,
             "map": float(theta[int(np.argmax(logw))])}
 
 
-def srp_mmse(feat: SRPFeatures, beta: float, prior: str = "flat", el_step: float = 1.0,
+class BetaByPeak:
+    """【修改 3】β 随 SRP 峰值高度自适应。
+
+    SRP 峰值高度（归一化后在 0~1 之间）反映这次观测的质量：信噪比高、混响弱时峰值高。
+    运行时不需要知道真实 SNR，只看这次的峰值高度落在哪个区间，就用该区间校准出的 β。
+    edges 是区间分界（升序），betas 比 edges 多一个元素。
+    """
+
+    def __init__(self, edges: Sequence[float], betas: Sequence[float]):
+        self.edges = list(map(float, edges))
+        self.betas = list(map(float, betas))
+        assert len(self.betas) == len(self.edges) + 1
+
+    def __call__(self, peak: float) -> float:
+        return self.betas[int(np.searchsorted(self.edges, peak))]
+
+    def __repr__(self):
+        return f"BetaByPeak(edges={[round(e, 3) for e in self.edges]}, betas={self.betas})"
+
+
+def srp_mmse(feat: SRPFeatures, beta, prior: str = "flat", el_step: float = 1.0,
              el_window: Optional[float] = None, **stage1_kw) -> Tuple[float, float, Dict]:
     """返回 (方位角, 俯仰角后验均值, 诊断信息)。
 
+    beta：一个数（固定 β），或 BetaByPeak（按峰值高度自适应）。
     el_window=None：在整个 [0°, 90°] 上算后验（最稳妥，91 次打分）；
     给定数值 r：只在 Stage 1 粗俯仰 ± r 内算（打分更少，但窗口外的概率被忽略）。
     """
@@ -62,9 +89,43 @@ def srp_mmse(feat: SRPFeatures, beta: float, prior: str = "flat", el_step: float
     else:
         theta = np.arange(max(0.0, th_hat - el_window), min(90.0, th_hat + el_window) + 1e-9, el_step)
     P = feat.score_azel(phi_hat, theta)
-    post = posterior_from_scores(theta, P, beta, prior)
-    return phi_hat, post["mean"], {"n_eval": feat.n_eval, "n_eval_stage1": n1,
-                                   "stage1_el": th_hat, **{f"post_{k}": v for k, v in post.items()}}
+    b = beta(float(P.max())) if callable(beta) else float(beta)
+    post = posterior_from_scores(theta, P, b, prior)
+    return phi_hat, post["mean"], {"n_eval": feat.n_eval, "n_eval_stage1": n1, "beta_used": b,
+                                   "peak": float(P.max()), "stage1_el": th_hat,
+                                   **{f"post_{k}": v for k, v in post.items()}}
+
+
+def calibrate_beta_by_peak(feats: Sequence[SRPFeatures], true_el: Sequence[float], n_bins: int = 3,
+                           betas: Iterable[float] = (10, 20, 40, 80, 160, 320, 640, 1280, 2560, 5120,
+                                                     10240, 20480, 40960),
+                           prior: str = "flat", el_step: float = 1.0) -> Tuple[BetaByPeak, Dict]:
+    """按 SRP 峰值高度把校准样本分成 n_bins 组（按分位数分），每组各选一个使俯仰 RMSE 最小的 β。
+
+    校准数据应覆盖多种 SNR / 混响条件，否则自适应没有意义。
+    """
+    betas = list(betas)
+    theta = np.arange(0.0, 90.0 + 1e-9, el_step)
+    curves, peaks = [], []
+    for f in feats:
+        phi_hat, _, _ = stage1_azimuth(f)
+        P = f.score_azel(phi_hat, theta)
+        curves.append(P)
+        peaks.append(float(P.max()))
+    peaks = np.asarray(peaks)
+    true_el = np.asarray(true_el, dtype=float)
+    edges = list(np.quantile(peaks, np.linspace(0, 1, n_bins + 1)[1:-1]))
+    bin_id = np.searchsorted(edges, peaks)
+    chosen, tables = [], {}
+    for b_id in range(n_bins):
+        idx = np.flatnonzero(bin_id == b_id)
+        table = {}
+        for b in betas:
+            est = np.array([posterior_from_scores(theta, curves[i], b, prior)["mean"] for i in idx])
+            table[b] = float(np.sqrt(np.mean((est - true_el[idx]) ** 2)))
+        chosen.append(min(table, key=table.get))
+        tables[b_id] = table
+    return BetaByPeak(edges, chosen), {"edges": edges, "tables": tables}
 
 
 def calibrate_beta(feats: Sequence[SRPFeatures], true_el: Sequence[float],

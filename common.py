@@ -67,6 +67,13 @@ def az_error(est, true):
     return np.abs(wrap180(np.asarray(est) - np.asarray(true)))
 
 
+def angular_error(az1, el1, az2, el2):
+    """两个方向之间的球面夹角（度）。接近头顶时不会像单独的方位误差那样被放大。"""
+    u1 = dir_vec(az1, el1)
+    u2 = dir_vec(az2, el2)
+    return np.degrees(np.arccos(np.clip(np.sum(u1 * u2, axis=-1), -1.0, 1.0)))
+
+
 def parabolic_vertex(y_m1: float, y0: float, y_p1: float) -> float:
     """三点抛物线插值，返回顶点相对中心点的偏移（以步长为单位，范围 [-0.5, 0.5]）。"""
     denom = y_m1 - 2.0 * y0 + y_p1
@@ -325,10 +332,16 @@ def sample_directions(n: int, rng: np.random.Generator, el_max: float = 89.0,
 
 
 def summarize(az_err: np.ndarray, el_err: np.ndarray, true_el: np.ndarray,
-              az_excl_el: float = 85.0, outlier_deg: float = 10.0) -> Dict[str, float]:
+              az_excl_el: float = 85.0, outlier_deg: float = 10.0,
+              ang_err: Optional[np.ndarray] = None) -> Dict[str, float]:
     keep = true_el < az_excl_el
     ae, ee = az_err[keep], el_err
-    return {
+    extra = {}
+    if ang_err is not None:
+        extra = {"ang_rmse": float(np.sqrt(np.mean(ang_err ** 2))),
+                 "ang_median": float(np.median(ang_err)),
+                 "ang_outlier_rate": float(np.mean(ang_err > outlier_deg))}
+    return {**extra,
         "az_rmse": float(np.sqrt(np.mean(ae ** 2))),
         "az_median": float(np.median(ae)),
         "az_outlier_rate": float(np.mean(ae > outlier_deg)),
